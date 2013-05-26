@@ -1,0 +1,590 @@
+#include "coordinator.h"
+
+/*
+Pseudo code:
+
+1. Define a set of functions that will be used for testing.
+
+   function_set = {read, write, chmod, mount, unmount, ...)
+
+
+2. Get from user the type of blocks to fail.
+
+   block_types = {ext3 inode, ext3 dir, ext3 super block, ...)
+
+
+3. Pass the information about the type of blocks to fail to
+   the SBA driver.
+
+
+4. Pick a function from the function_set and run it.
+
+
+5. After the function ends, check with the SBA driver if it
+   observed the block to fail and failed it. If so, return
+   the result about file system behavior, SBA traces and system
+   log file info to the user. If SBA driver did not observe
+   the block to fail, run the next function from the function_set.
+
+
+6. If none of the functions could create the traffic with the
+   block to fail, then report to the user.
+ */
+
+/*this structure holds the fault specification*/
+fault *sba_fault;
+
+/*to issue ioctl calls to the device*/
+int disk_fd = -1;
+
+/*log file where all the results will go*/
+char *logfile = "logfile";
+
+/*total number of workloads*/
+int total_workloads = 1;
+
+int main(int argc, char *argv[])
+{
+	char *fault_spec;
+	char *block_spec;
+	
+	if (argc != 3) {
+		fprintf(stderr, "Usage: coordinator <fault-spec> <block-spec>\n");
+		fprintf(stderr, "       where <fault-spec> is a file with fault specification\n");
+		fprintf(stderr, "       where <block-spec> is a file with block types to fail\n");
+		return -1;
+	}
+
+	init_sys();
+
+	fault_spec = argv[1];
+	block_spec = argv[2];
+
+	get_fault_specification(fault_spec);
+
+	run_tests(block_spec);
+
+	cleanup_sys();
+
+	return 1;
+}
+
+int init_sys()
+{
+	sba_fault = (fault *)malloc(sizeof(fault));
+	memset(sba_fault, 0, sizeof(fault));
+
+	if ((disk_fd = open(DEVICE, O_RDONLY)) < 0) {
+		fprintf(stderr, "Error: unable to open the dev %s\n", DEVICE);
+		exit(-1);
+	}
+
+	vp_init_lib(logfile);
+
+	return 1;
+}
+
+int cleanup_sys()
+{
+	free(sba_fault);
+	close(disk_fd);
+
+	return 1;
+}
+
+int wait_for_response()
+{
+	printf("when complete type \"ok\" to proceed\n");
+
+	while (1) {
+		char response[64];
+		scanf("%s", response);
+		if (strcmp("ok", response) == 0) {
+			break;
+		}
+	}
+
+	return 1;
+}
+
+char *get_block_type_str(int btype)
+{
+	switch(btype) {
+		case SBA_EXT3_INODE:
+			return "SBA_EXT3_INODE";
+		break;
+
+		case SBA_EXT3_DBITMAP:
+			return "SBA_EXT3_DBITMAP";
+		break;
+
+		case SBA_EXT3_IBITMAP:
+			return "SBA_EXT3_IBITMAP";
+		break;
+
+		case SBA_EXT3_SUPER:
+			return "SBA_EXT3_SUPER";
+		break;
+
+		case SBA_EXT3_GROUP:
+			return "SBA_EXT3_GROUP";
+		break;
+
+		case SBA_EXT3_DATA:
+			return "SBA_EXT3_DATA";
+		break;
+
+		case SBA_EXT3_REVOKE:
+			return "SBA_EXT3_REVOKE";
+		break;
+
+		case SBA_EXT3_DESC:
+			return "SBA_EXT3_DESC";
+		break;
+
+		case SBA_EXT3_COMMIT:
+			return "SBA_EXT3_COMMIT";
+		break;
+
+		case SBA_EXT3_JSUPER:
+			return "SBA_EXT3_JSUPER";
+		break;
+
+		case SBA_EXT3_JDATA:
+			return "SBA_EXT3_JDATA";
+		break;
+
+		case SBA_EXT3_DIR:
+			return "SBA_EXT3_DIR";
+		break;
+
+		case SBA_EXT3_INDIR:
+			return "SBA_EXT3_INDIR";
+		break;
+
+		default:
+			return "UNKNOWN";
+	}
+}
+
+int print_fault(fault *fs_fault)
+{
+	char *filesystem = "";
+	char *rw = "";
+	char *ftype = "";
+	char *fmode = "";
+	char *btype = "";
+
+	printf("<=========Fault Type=========>\n");
+
+	/*Filesystem*/
+	switch(fs_fault->filesystem) {
+		case EXT3:
+			filesystem = "Ext3";
+		break;
+
+		case REISERFS:
+			filesystem = "Reiserfs";
+		break;
+
+		case JFS:
+			filesystem = "JFS";
+		break;
+
+		default:
+			filesystem = "Unknown";
+		break;
+	}
+
+	/*When*/
+	switch(fs_fault->rw) {
+		case SBA_READ:
+			rw = "read";
+		break;
+
+		case SBA_WRITE:
+			rw = "write";
+		break;
+
+		default:
+			rw = "unknown";
+		break;
+	}
+
+	/*fault type*/
+	switch(fs_fault->fault_type) {
+		case SBA_FAIL:
+			ftype = "fail";
+		break;
+
+		case SBA_CORRUPT:
+			ftype = "corrupt";
+		break;
+
+		default:
+			ftype = "unknown";
+		break;
+	}
+	
+	/*fault mode*/
+	switch(fs_fault->fault_mode) {
+		case STICKY:
+			fmode = "sticky";
+		break;
+
+		case TRANSIENT:
+			fmode = "transient";
+		break;
+
+		default:
+			fmode = "unknown";
+		break;
+	}
+
+	/*block type*/
+	btype = get_block_type_str(fs_fault->blk_type);
+	
+	printf("FS: %s RW: %s TYPE: %s MODE: %s BLK: %s NR: %d\n", 
+	filesystem, rw, ftype, fmode, btype, fs_fault->blocknr);
+
+	return 1;
+}
+
+int get_fault_specification(char *fault_spec)
+{
+	static FILE *fspec = NULL;
+
+	fspec = fopen(fault_spec, "r");
+	if (!fspec) {
+		fprintf(stderr, "Error: unable to open the input file %s\n", fault_spec);
+		exit(-1);
+	}
+
+	if (!feof(fspec)) {
+		char input[64];
+
+		fscanf(fspec, "rw: %s\n", input);
+		if (strcmp(input, "read") == 0) {
+			sba_fault->rw = SBA_READ;
+		}
+		else 
+		if (strcmp(input, "write") == 0) {
+			sba_fault->rw = SBA_WRITE;
+		}
+		else {
+			goto fspec_err;
+		}
+
+		fscanf(fspec, "fault_type: %s\n", input);
+		if (strcmp(input, "fail") == 0) {
+			sba_fault->fault_type = SBA_FAIL;
+		}
+		else 
+		if (strcmp(input, "corrupt") == 0) {
+			sba_fault->fault_type = SBA_CORRUPT;
+		}
+		else {
+			goto fspec_err;
+		}
+
+		fscanf(fspec, "fault_mode: %s\n", input);
+		if (strcmp(input, "transient") == 0) {
+			sba_fault->fault_mode = TRANSIENT;
+		}
+		else 
+		if (strcmp(input, "sticky") == 0) {
+			sba_fault->fault_mode = STICKY;
+		}
+		else {
+			goto fspec_err;
+		}
+
+		fscanf(fspec, "filesystem: %s\n", input);
+		if (strcmp(input, "ext3") == 0) {
+			sba_fault->filesystem = EXT3;
+		}
+		else 
+		if (strcmp(input, "reiserfs") == 0) {
+			sba_fault->filesystem = REISERFS;
+		}
+		else 
+		if (strcmp(input, "jfs") == 0) {
+			sba_fault->filesystem = JFS;
+		}
+		else {
+			goto fspec_err;
+		}
+
+		//print_fault(sba_fault);
+
+		return 1;
+	}
+
+	fspec_err:
+	print_fault(sba_fault);
+	fprintf(stderr, "Error: invalid falut specification\n");
+
+	return -1;
+}
+
+int inject_fault()
+{
+	printf("Injecting the fault ...\n");
+	ioctl(disk_fd, INJECT_FAULT, (void *)sba_fault);
+
+	return 1;
+}
+
+int remove_fault()
+{
+	printf("Removing the fault ...\n");
+	ioctl(disk_fd, REMOVE_FAULT);
+
+	return 1;
+}
+
+int fault_injected()
+{
+	int response = 0;
+	
+	ioctl(disk_fd, FAULT_INJECTED, &response);
+
+	if (response) {
+		printf("The fault has been injected successfully\n");
+	}
+
+	return response;
+}
+
+int run_workload(int workload)
+{
+	switch(workload) {
+
+		case 0: /*create an empty file*/
+		{
+			/*create_file parameters: <file name> <size(KB)>*/
+			int argc = 3;
+			char *argv[3];
+
+			argv[0] = "create_file";
+			argv[1] = "/mnt/sba/testdir/file";
+			argv[2] = "48";
+			
+			printf("Running workload \"create_file\" ...\n");
+			create_file(argc, argv);
+		}
+		break;
+
+		default:
+			fprintf(stderr, "Error: unknown workload\n");
+
+	}
+	
+	return 1;
+}
+
+int run_all_workloads()
+{
+	int i;
+
+	for (i = 0; i < total_workloads; i ++) {
+		/*run the workload 'i'*/
+		run_workload(i);
+
+		wait_for_response();
+
+		/*check if this initiated the necessary traffic*/
+		if (fault_injected()) {
+			return 1;
+		}
+
+		wait_for_response();
+	}
+
+	return -1;
+}
+
+int notify_sba(char *cmd)
+{
+	char sys_cmd[64];
+
+	sprintf(sys_cmd, "./tools/sba %s", cmd);
+	system(sys_cmd);
+
+	return 1;
+}
+
+int clear_all()
+{
+	/*stop testing*/
+	notify_sba("dont_test");
+
+	/*clean all the statistics*/
+	notify_sba("clean_stats");
+	notify_sba("zero_stat");
+
+	/*remove the fault if there was any*/
+	notify_sba("remove_fault");
+
+	return 1;
+}
+
+int build_fs()
+{
+	switch(sba_fault->filesystem) {
+		case EXT3:
+		system("mke2fs -j -J size=32 -b 4096 /dev/SBA");
+		notify_sba("start");
+		break;
+
+		default:
+		fprintf(stderr, "Error: unsupported file system\n");
+	}
+
+	return 1;
+}
+
+int create_test_state()
+{
+	system("mkdir /mnt/sba/testdir/");
+	return 1;
+}
+
+int create_setup()
+{
+	/*delete all the old statistics and any data from the previous setup*/
+	clear_all();
+
+	/*create the new file system*/
+	build_fs();
+
+	/*move the system to the required state for testing*/
+	create_test_state();
+	
+	return 1;
+}
+
+int run_tests(char *input_file)
+{
+	int block_type;
+
+	/*get the inputs about blocks to fail*/
+	while ((block_type = get_next_block(input_file, sba_fault)) >= 0) {
+
+		/*build the new file system setup for testing*/
+	
+		/*construct a fault specification with this block type*/
+		printf("The current fault specification is:");
+		print_fault(sba_fault);
+
+		/*pass it to the driver*/
+		inject_fault();
+
+		/*run workloads to initiate fs traffic to activate the fault*/
+		run_all_workloads();
+
+		/*remove the fault from the driver*/
+		remove_fault();
+	}
+
+	return 1;
+}
+
+int get_next_block(char *input_file, fault *fs_fault)
+{
+	static FILE *file_ptr = NULL;
+
+	if (!file_ptr) {
+		/*this is the first time the file is opened*/
+		if (input_file) {
+			file_ptr = fopen(input_file, "r");
+			if (!file_ptr) {
+				fprintf(stderr, "Error: unable to open the input file %s\n", input_file);
+				exit(-1);
+			}
+		}
+		else {
+			fprintf(stderr, "Error: invalid input file\n");
+			exit(-1);
+		}
+	}
+	
+	if (file_ptr) {
+		/*the file has been opened successfully*/
+
+		if (!feof(file_ptr)) {
+			char btype[64];
+
+			fscanf(file_ptr, "%s %d\n", btype, &(fs_fault->blocknr));
+			fs_fault->blk_type = get_block_type(btype);
+
+			//printf("Read block type %s (%0x) with blocknr %d from input file\n", 
+			//btype, fs_fault->blk_type, fs_fault->blocknr);
+
+			return fs_fault->blk_type;
+		}
+	}
+
+	return -1;
+
+}
+
+int get_block_type(char *btype)
+{
+	int block_type = UNKNOWN_BLOCK;
+
+	/*for ext3*/
+	if (strcmp(btype, "SBA_EXT3_INODE") == 0) {
+		block_type = SBA_EXT3_INODE;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_DBITMAP") == 0) {
+		block_type = SBA_EXT3_DBITMAP;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_IBITMAP") == 0) {
+		block_type = SBA_EXT3_IBITMAP;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_SUPER") == 0) {
+		block_type = SBA_EXT3_SUPER;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_GROUP") == 0) {
+		block_type = SBA_EXT3_GROUP;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_DATA") == 0) {
+		block_type = SBA_EXT3_DATA;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_REVOKE") == 0) {
+		block_type = SBA_EXT3_REVOKE;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_DESC") == 0) {
+		block_type = SBA_EXT3_DESC;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_COMMIT") == 0) {
+		block_type = SBA_EXT3_COMMIT;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_JSUPER") == 0) {
+		block_type = SBA_EXT3_JSUPER;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_JDATA") == 0) {
+		block_type = SBA_EXT3_JDATA;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_DIR") == 0) {
+		block_type = SBA_EXT3_DIR;
+	}
+	else
+	if (strcmp(btype, "SBA_EXT3_INDIR") == 0) {
+		block_type = SBA_EXT3_INDIR;
+	}
+
+	return block_type;
+}

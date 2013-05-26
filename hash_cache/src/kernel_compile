@@ -1,0 +1,2 @@
+gcc -Wall -DUSE_RPC -D__KERNEL__ -DMODULE -I/p/wind/pif/1/adaptation/linux/include -D__SMP__ -DSMP -O2 -I./ -I../include -c -o hashtable.o hashtable.c
+

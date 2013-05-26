@@ -1,0 +1,4 @@
+rw: read
+fault_type: fail
+fault_mode: sticky
+filesystem: ext3
